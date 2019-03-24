@@ -620,7 +620,11 @@ if(ENABLE_SHARED)
         elseif(CYGWIN)
             # Cygwin is not officially supported or tested. MinGW with msys is recommended.
         else()
+		# comment the other line and uncomment the next line if using G++
+		# compiled with the GNU linker or GNU gold (either of which work reasonably well
+		# on modern Solaris)
 		#list(APPEND LINKER_OPTIONS "-mimpure-text -Wa,--noexecstack -Wl,-Bsymbolic,-z,noexecstack")
+		# otherwise, use this if using sun studio, G++, or clang paired with the native linker
 		list(APPEND LINKER_OPTIONS "-Wl,-M,/usr/lib/ld/map.noexstk")
         endif()
     endif()
