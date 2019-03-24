@@ -1,0 +1,174 @@
+diff -r c7e5878bdd31 source/CMakeLists.txt
+--- a/source/CMakeLists.txt	Thu Mar 07 19:19:26 2019 +0530
++++ b/source/CMakeLists.txt	Sun Mar 17 04:18:52 2019 -0500
+@@ -644,7 +644,8 @@
+         elseif(CYGWIN)
+             # Cygwin is not officially supported or tested. MinGW with msys is recommended.
+         else()
+-            list(APPEND LINKER_OPTIONS "-Wl,-Bsymbolic,-znoexecstack")
++		list(APPEND LINKER_OPTIONS "-mimpure-text -Wa,--noexecstack -Wl,-Bsymbolic,-z,noexecstack")
++		#list(APPEND LINKER_OPTIONS "-Wl,-M,/usr/lib/ld/map.noexstk")
+         endif()
+     endif()
+     set_target_properties(x265-shared PROPERTIES SOVERSION ${X265_BUILD})
+diff -r c7e5878bdd31 source/common/common.h
+--- a/source/common/common.h	Thu Mar 07 19:19:26 2019 +0530
++++ b/source/common/common.h	Sun Mar 17 04:18:52 2019 -0500
+@@ -39,7 +39,15 @@
+ #include <stdint.h>
+ #include <memory.h>
+ #include <assert.h>
+-
++#include <limits.h>
++#include <math.h>
++#include <stdarg.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++#include <time.h>
+ #include "x265.h"
+ 
+ #if ENABLE_PPA && ENABLE_VTUNE
+@@ -70,7 +78,7 @@
+ #define FENC_STRIDE 64
+ #define NUM_INTRA_MODE 35
+ 
+-#if defined(__GNUC__)
++#if defined(__GNUC__) || defined(__SUNPRO_CC)
+ #define ALIGN_VAR_4(T, var)  T var __attribute__((aligned(4)))
+ #define ALIGN_VAR_8(T, var)  T var __attribute__((aligned(8)))
+ #define ALIGN_VAR_16(T, var) T var __attribute__((aligned(16)))
+diff -r c7e5878bdd31 source/common/mv.h
+--- a/source/common/mv.h	Thu Mar 07 19:19:26 2019 +0530
++++ b/source/common/mv.h	Sun Mar 17 04:18:52 2019 -0500
+@@ -46,7 +46,7 @@
+ 
+     MV()                                       {}
+     MV(int32_t w) : word(w)                    {}
+-    MV(int16_t _x, int16_t _y) : x(_x), y(_y)  {}
++    MV(int16_t _x, int16_t _y) {x = _x; y = _y;}
+ 
+     MV& operator =(uint32_t w)                 { word = w; return *this; }
+ 
+diff -r c7e5878bdd31 source/common/threading.h
+--- a/source/common/threading.h	Thu Mar 07 19:19:26 2019 +0530
++++ b/source/common/threading.h	Sun Mar 17 04:18:52 2019 -0500
+@@ -66,6 +66,52 @@
+ #define ATOMIC_ADD(ptr, val)  no_atomic_add((int*)ptr, val)
+ #define GIVE_UP_TIME()        usleep(0)
+ 
++#elif __SUNPRO_CC
++#include <unistd.h>
++// Returns the number of leading 0-bits in x, starting at the most significant bit position.
++// If x is zero, the result is undefined.
++static inline int __clzsi2(unsigned x)
++{
++  // This uses a binary search (counting down) algorithm from Hacker's Delight.
++   unsigned y;
++   int n = 32;
++   y = x >>16;  if (y != 0) {n = n -16;  x = y;}
++   y = x >> 8;  if (y != 0) {n = n - 8;  x = y;}
++   y = x >> 4;  if (y != 0) {n = n - 4;  x = y;}
++   y = x >> 2;  if (y != 0) {n = n - 2;  x = y;}
++   y = x >> 1;  if (y != 0) return n - 2;
++   return n - x;
++}
++
++// Returns the number of trailing 0-bits in x, starting at the least significant bit position.
++// If x is zero, the result is undefined.
++static inline int __ctzsi2(unsigned x)
++{
++  // This uses a binary search algorithm from Hacker's Delight.
++  int n = 1;
++  if ((x & 0x0000FFFF) == 0) {n = n +16; x = x >>16;}
++  if ((x & 0x000000FF) == 0) {n = n + 8; x = x >> 8;}
++  if ((x & 0x0000000F) == 0) {n = n + 4; x = x >> 4;}
++  if ((x & 0x00000003) == 0) {n = n + 2; x = x >> 2;}
++  return n - (x & 1);
++}
++
++#define CLZ(id, x)            id = (unsigned long)__clzsi2(x) ^ 31
++#define CTZ(id, x)            id = (unsigned long)__ctzsi2(x)
++#define ATOMIC_OR(ptr, mask)  __sync_fetch_and_or(ptr, mask)
++#define ATOMIC_AND(ptr, mask) __sync_fetch_and_and(ptr, mask)
++#define ATOMIC_INC(ptr)       __sync_add_and_fetch((volatile int32_t*)ptr, 1)
++#define ATOMIC_DEC(ptr)       __sync_add_and_fetch((volatile int32_t*)ptr, -1)
++#define ATOMIC_ADD(ptr, val)  __sync_fetch_and_add((volatile int32_t*)ptr, val)
++#define GIVE_UP_TIME()        usleep(0)
++
++// Returns the index of the least significant 1-bit in x, or the value zero if x is zero.
++// The least significant bit is index one.
++static inline int __ffsdi2 (unsigned x)
++{
++  return (x == 0) ? 0 : __ctzsi2(x) + 1;
++}
++
+ #elif __GNUC__               /* GCCs builtin atomics */
+ 
+ #include <sys/time.h>
+diff -r c7e5878bdd31 source/encoder/analysis.cpp
+--- a/source/encoder/analysis.cpp	Thu Mar 07 19:19:26 2019 +0530
++++ b/source/encoder/analysis.cpp	Sun Mar 17 04:18:52 2019 -0500
+@@ -2668,8 +2668,8 @@
+             {
+                 offset = (depth * X265_REFINE_INTER_LEVELS) + i;
+                 /* Calculate distance values */
+-                diffRefine[i] = abs((int64_t)(trainData.cuVariance - m_frame->m_classifyVariance[offset]));
+-                diffRefineRd[i] = abs((int64_t)(cuCost - m_frame->m_classifyRd[offset]));
++                diffRefine[i] = abs((long double)(int64_t)(trainData.cuVariance - m_frame->m_classifyVariance[offset]));
++                diffRefineRd[i] = abs((long double)(int64_t)(cuCost - m_frame->m_classifyRd[offset]));
+ 
+                 /* Calculate prior probability - ranges between 0 and 1 */
+                 if (trainingCount)
+@@ -3696,7 +3696,7 @@
+ 
+     // 2. Calculate ac component
+     uint64_t z_k = 0;
+-    int block = (int)((log(blockSize) / log(2)) - 2);
++    int block = (int)((log((double)blockSize) / log((double)2)) - 2);
+     primitives.cu[block].normFact(src, blockSize, shift, &z_k);
+ 
+     // Remove the DC part
+diff -r c7e5878bdd31 source/encoder/encoder.cpp
+--- a/source/encoder/encoder.cpp	Thu Mar 07 19:19:26 2019 +0530
++++ b/source/encoder/encoder.cpp	Sun Mar 17 04:18:52 2019 -0500
+@@ -337,7 +337,7 @@
+                     double start = quantF / (m_scalingList.m_quantCoef[trSize][numList][QP_MAX_SPEC % 6][i]);
+ 
+                     // Formula chosen as an exponential scale to vaguely mimic the effects of a higher quantizer.
+-                    double bias = (pow(2, pos * (QP_MAX_MAX - QP_MAX_SPEC)) * 0.003 - 0.003) * start;
++                    double bias = (pow((double)2, pos * (QP_MAX_MAX - QP_MAX_SPEC)) * 0.003 - 0.003) * start;
+                     nrOffset[i] = (uint16_t)X265_MIN(bias + 0.5, INT16_MAX);
+                 }
+             }
+@@ -4208,7 +4208,7 @@
+         {
+             /* Number of 4x4 blocks in out of bound region */
+             int outOfBound = m_param->maxCUSize / 2;
+-            uint32_t sum = (uint32_t)pow((outOfBound >> 2), 2);
++            uint32_t sum = (uint32_t)pow((double)(outOfBound >> 2), 2);
+             index += sum;
+         }
+         cuLoc->switchCondition += m_param->num4x4Partitions;
+@@ -4235,7 +4235,7 @@
+             else
+             {
+                 int outOfBound = m_param->maxCUSize / 2;
+-                uint32_t sum = (uint32_t)(2 * pow((abs(outOfBound) >> 2), 2));
++                uint32_t sum = (uint32_t)(2 * pow((double)(abs(outOfBound) >> 2), 2));
+                 index += sum;
+             }
+             *count = cuLoc->evenRowIndex;
+diff -r c7e5878bdd31 source/output/yuv.cpp
+--- a/source/output/yuv.cpp	Thu Mar 07 19:19:26 2019 +0530
++++ b/source/output/yuv.cpp	Sun Mar 17 04:18:52 2019 -0500
+@@ -24,6 +24,7 @@
+ #include "common.h"
+ #include "output.h"
+ #include "yuv.h"
++#include <ios>
+ 
+ using namespace X265_NS;
+ using namespace std;
